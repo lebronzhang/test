@@ -170,11 +170,20 @@ class RealSenseViewer
     void
     run ()
     {
+      printf("start run\n");
       boost::function<void (const typename PointCloudT::ConstPtr&)> f = boost::bind (&RealSenseViewer::cloudCallback, this, _1);
+      printf("start register\n");
       connection_ = grabber_.registerCallback (f);
+      printf("start begin\n");
       grabber_.start ();
+      printf("getMode\n");
       printMode (grabber_.getMode ());
-      viewer_.setSize (grabber_.getMode ().depth_width, grabber_.getMode ().depth_height);
+      printf("setsize\n");
+      printf("grabber_.getMode ().depth_width: %i, grabber_.getMode ().depth_height: %i\n",grabber_.getMode ().depth_width,
+      grabber_.getMode ().depth_height  );
+      //viewer_.setSize (grabber_.getMode ().depth_width, grabber_.getMode ().depth_height);
+      viewer_.setSize (480, 360);
+      printf("while start\n");
       while (!viewer_.wasStopped ())
       {
         if (new_cloud_)

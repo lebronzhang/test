@@ -36,39 +36,89 @@
  *
  */
 
-#ifndef PCL_IO_REAL_SENSE_GRABBER_H
+#ifndef PCL_IO_REAL_SENSE_GRABBER_H //name change due to position change
 #define PCL_IO_REAL_SENSE_GRABBER_H
 
+#include <boost/thread/thread.hpp>
+#include <boost/thread/mutex.hpp>
+
+//#include <pcl/io/buffers.h>
 #include <pcl/io/grabber.h>
-//#include <pcl/io/real_sense_common.h>//// file position
-#include "real_sense_common.h"
+#include <pcl/point_cloud.h>
+#include <pcl/point_types.h>
+#include <pcl/common/time.h>
 
 namespace pcl
 {
-  namespace io
-  {
-  	template <typename T> class Buffer;
-
-  	namespace real_sense
-  	{
-  	  class RealSenseDevice;
-  	  class Common;
-  	}
+  namespace io 
+  { 
+    template <typename T> class Buffer;
+    namespace real_sense 
+    { 
+      class RealSenseDevice;
+      struct RealSenseGrabberImpl; 
+    } 
   }
-
-  using namespace pcl::io::real_sense;
 
   class PCL_EXPORTS RealSenseGrabber : public Grabber
   {
     public:
 
       typedef
-            void (sig_cb_real_sense_point_cloud)
-              (const pcl::PointCloud<pcl::PointXYZ>::ConstPtr&);
+        void (sig_cb_real_sense_point_cloud)
+          (const pcl::PointCloud<pcl::PointXYZ>::ConstPtr&);
           
       typedef
-            void (sig_cb_real_sense_point_cloud_rgba)
-              (const pcl::PointCloud<pcl::PointXYZRGBA>::ConstPtr&);
+        void (sig_cb_real_sense_point_cloud_rgba)
+          (const pcl::PointCloud<pcl::PointXYZRGBA>::ConstPtr&);
+
+          /** A descriptor for capturing mode.
+            *
+            * Consists of framerate and resolutions of depth and color streams.
+            * Serves two purposes: to describe the desired capturing mode when
+            * creating a grabber, and to list the available modes supported by the
+            * grabber (see getAvailableModes()). In the first case setting some
+            * fields to zero means "don't care", i.e. the grabber is allowed to
+            * decide itself which concrete values to use. */
+
+      struct PCL_EXPORTS Mode
+      {
+        unsigned int fps;
+        unsigned int depth_width;
+        unsigned int depth_height;
+        unsigned int color_width;
+        unsigned int color_height;
+      
+        /** Set all fields to zero (i.e. "don't care"). */
+        Mode ();
+
+        /** Set desired framerate, the rest is "don't care". */
+        Mode (unsigned int fps);
+
+        /** Set desired depth resolution, the rest is "don't care". */
+        Mode (unsigned int depth_width, unsigned int depth_height);
+
+        /** Set desired framerate and depth resolution, the rest is "don't
+          * care". */
+        Mode (unsigned int fps, unsigned int depth_width, unsigned int depth_height);
+
+        /** Set desired depth and color resolution, the rest is "don't
+          * care". */
+        Mode (unsigned int depth_width, unsigned int depth_height, unsigned int color_width, unsigned int color_height);
+
+        /** Set desired framerate, depth and color resolution. */
+        Mode (unsigned int fps, unsigned int depth_width, unsigned int depth_height, unsigned int color_width, unsigned int color_height);
+
+        bool
+        operator== (const pcl::RealSenseGrabber::Mode& m) const;
+      };
+
+      enum TemporalFilteringType
+      {
+        RealSense_None = 0,
+        RealSense_Median = 1,
+        RealSense_Average = 2,
+      };
 
       /** Create a grabber for a RealSense device.
         *
@@ -86,9 +136,9 @@ namespace pcl
         * If the default is supplied, then the mode closest to VGA at 30 Hz
         * will be chosen.
         * \param[in] strict if set to \c true, an exception will be thrown if
-        * device does not support exactly the mode requsted. Otherwise the
-        * closest available mode is selected. */
-      RealSenseGrabber (const std::string& device_id = "", const Common::Mode& mode = Common::Mode (), bool strict = false);
+         * device does not support exactly the mode requsted. Otherwise the
+            * closest available mode is selected. */
+      RealSenseGrabber (const std::string& device_id = "", const Mode& mode = Mode (), bool strict = false);
 
       virtual
       ~RealSenseGrabber () throw ();
@@ -103,7 +153,10 @@ namespace pcl
       isRunning () const;
 
       virtual std::string
-      getName () const;
+      getName () const
+      {
+        return (std::string ("RealSenseGrabber"));
+      }
 
       virtual float
       getFramesPerSecond () const;
@@ -123,7 +176,7 @@ namespace pcl
         * \note if the grabber is running and the new parameters are different
         * from the current parameters, grabber will be restarted. */
       void
-      enableTemporalFiltering (Common::TemporalFilteringType type, size_t window_size);
+      enableTemporalFiltering (TemporalFilteringType type, size_t window_size);
 
       /** Disable temporal filtering. */
       void
@@ -140,7 +193,7 @@ namespace pcl
         *
         * \note: this list exclude modes where framerates of the depth and
         * color streams do not match. */
-      std::vector<Common::Mode>
+      std::vector<Mode>
       getAvailableModes (bool only_depth = false) const;
 
       /** Set desired capturing mode.
@@ -148,23 +201,19 @@ namespace pcl
         * \note if the grabber is running and the new mode is different the
         * one requested previously, grabber will be restarted. */
       void
-      setMode (const Common::Mode& mode, bool strict = false);
+      setMode (const Mode& mode, bool strict = false);
 
       /** Get currently active capturing mode.
         *
         * \note: capturing mode is selected when start() is called; output of
         * this function before grabber was started is undefined. */
-      const Common::Mode&
-      getMode () const;
+      const Mode&
+      getMode () const
+      {
+        return (mode_selected_);
+      }
 
     private:
-
-      // Signals to indicate whether new clouds are available
-      boost::signals2::signal<sig_cb_real_sense_point_cloud>* point_cloud_signal_;
-      boost::signals2::signal<sig_cb_real_sense_point_cloud_rgba>* point_cloud_rgba_signal_;
-
-      void
-      run ();
 
       void
       createDepthBuffer ();
@@ -172,8 +221,59 @@ namespace pcl
       void
       selectMode ();
 
-      Common common;
+      /** Compute a score which indicates how different is a given mode is from
+        * the mode requested by the user.
+        *
+        * Importance of factors: fps > depth resolution > color resolution. The
+        * lower the score the better. */
+      float
+      computeModeScore (const Mode& mode);
+
+      // Signals to indicate whether new clouds are available
+      boost::signals2::signal<sig_cb_real_sense_point_cloud>* point_cloud_signal_;
+      boost::signals2::signal<sig_cb_real_sense_point_cloud_rgba>* point_cloud_rgba_signal_;
+
+      boost::shared_ptr<pcl::io::real_sense::RealSenseDevice> device_;
+
+      bool is_running_;
+      unsigned int confidence_threshold_;
+
+      TemporalFilteringType temporal_filtering_type_;
+      size_t temporal_filtering_window_size_;
+
+      /// Capture mode requested by the user at construction time
+      Mode mode_requested_;
+
+      /// Whether or not selected capture mode should strictly match what the user
+      /// has requested
+      bool strict_;
+
+      /// Capture mode selected by grabber (among the modes supported by the
+      /// device), computed and stored on start()
+      Mode mode_selected_;
+
+      /// Indicates whether there are subscribers for PointXYZ signal, computed
+      /// and stored on start()
+      bool need_xyz_;
+
+      /// Indicates whether there are subscribers for PointXYZRGBA signal,
+      /// computed and stored on start()
+      bool need_xyzrgba_;
+
+      EventFrequency frequency_;
+      mutable boost::mutex fps_mutex_;
+
+      boost::thread thread_;
+
+      /// Depth buffer to perform temporal filtering of the depth images
+      boost::shared_ptr<pcl::io::Buffer<unsigned short> > depth_buffer_;
+
+      pcl::io::real_sense::RealSenseGrabberImpl* p_;
+      friend struct pcl::io::real_sense::RealSenseGrabberImpl;
   };
 }
+
+bool
+operator== (const pcl::RealSenseGrabber::Mode& m1, const pcl::RealSenseGrabber::Mode& m2);
 
 #endif /* PCL_IO_REAL_SENSE_GRABBER_H */

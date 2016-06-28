@@ -35,30 +35,85 @@
  *  POSSIBILITY OF SUCH DAMAGE.
  *
  */
-#include <pcl/common/io.h>
-#include <pcl/io/buffers.h>
-//#include <pcl/io/io_exception.h>
-//#include <pcl/io/real_sense/librealsense/real_sense_grabber.h>
 
+#include <boost/lexical_cast.hpp>
+
+#include <pcl/common/io.h>
+#include <pcl/common/time.h>
+
+#include <pcl/io/buffers.h>
+#include <pcl/io/io_exception.h>
+//#include <pcl/io/real_sense/real_sense_common.h>
 #include "real_sense_grabber.h"
+#include "real_sense_grabber_impl.h"
 #include "real_sense_device_manager.h"
 
-#include <librealsense/rs.hpp>
+/*#ifdef USE_RSSDK
+#include <pcl/io/real_sense/RSSDK/real_sense_device_manager.h>
+#else
+#include <pcl/io/real_sense/librealsense/real_sense_device_manager.h>
+#endif*/
 
 using namespace pcl::io;
 using namespace pcl::io::real_sense;
 
-pcl::RealSenseGrabber::RealSenseGrabber (const std::string& device_id, const Common::Mode& mode, bool strict)
-: Grabber ()
-, common (device_id, mode, strict)
-/*, pcl::io::real_sense::Common::is_running_ (false)
-, pcl::io::real_sense::Common::confidencce_threshold_ (6)
-, pcl::io::real_sense::Common::temporal_filtering_type_ (RealSense_None)
-, pcl::io::real_sense::Common::temporal_filtering_window_size_ (1)
-, pcl::io::real_sense::Common::mode_requested_ (mode)
-, pcl::io::real_sense::Common::strict_ (strict)*/
+pcl::RealSenseGrabber::Mode::Mode ()
+: fps (0), depth_width (0), depth_height (0), color_width (0), color_height (0)
 {
-  //common = pcl::io::real_sense::Common (device_id, mode, strict);
+}
+
+pcl::RealSenseGrabber::Mode::Mode (unsigned int f)
+: fps (f), depth_width (0), depth_height (0), color_width (0), color_height (0)
+{
+}
+
+pcl::RealSenseGrabber::Mode::Mode (unsigned int dw, unsigned int dh)
+: fps (0), depth_width (dw), depth_height (dh), color_width (0), color_height (0)
+{
+}
+
+pcl::RealSenseGrabber::Mode::Mode (unsigned int f, unsigned int dw, unsigned int dh)
+: fps (f), depth_width (dw), depth_height (dh), color_width (0), color_height (0)
+{
+}
+
+pcl::RealSenseGrabber::Mode::Mode (unsigned int dw, unsigned int dh, unsigned int cw, unsigned int ch)
+: fps (0), depth_width (dw), depth_height (dh), color_width (cw), color_height (ch)
+{
+}
+
+pcl::RealSenseGrabber::Mode::Mode (unsigned int f, unsigned int dw, unsigned int dh, unsigned int cw, unsigned int ch)
+: fps (f), depth_width (dw), depth_height (dh), color_width (cw), color_height (ch)
+{
+}
+
+bool
+pcl::RealSenseGrabber::Mode::operator== (const pcl::RealSenseGrabber::Mode& m) const
+{
+  return (this->fps == m.fps &&
+  	      this->depth_width == m.depth_width &&
+          this->depth_height == m.depth_height &&
+          this->color_width == m.color_width &&
+          this->color_height == m.color_height);
+}
+
+pcl::RealSenseGrabber::RealSenseGrabber (const std::string& device_id, const Mode& mode, bool strict)
+: Grabber ()
+, p_ (new pcl::io::real_sense::RealSenseGrabberImpl (this))
+, is_running_ (false)
+, confidence_threshold_ (6)
+, temporal_filtering_type_ (RealSense_None)
+, temporal_filtering_window_size_ (1)
+, mode_requested_ (mode)
+, strict_ (strict)
+{
+  if (device_id == "")
+    device_ = RealSenseDeviceManager::getInstance ()->captureDevice ();
+  else if (device_id[0] == '#')
+    device_ = RealSenseDeviceManager::getInstance ()->captureDevice (boost::lexical_cast<int> (device_id.substr (1)) - 1);
+  else
+    device_ = RealSenseDeviceManager::getInstance ()->captureDevice (device_id);
+
   point_cloud_signal_ = createSignal<sig_cb_real_sense_point_cloud> ();
   point_cloud_rgba_signal_ = createSignal<sig_cb_real_sense_point_cloud_rgba> ();
 }
@@ -74,49 +129,36 @@ pcl::RealSenseGrabber::~RealSenseGrabber () throw ()
 void
 pcl::RealSenseGrabber::start ()
 {
-  if (!common.is_running_)
+  if (!is_running_)
   {
-    common.need_xyz_ = num_slots<sig_cb_real_sense_point_cloud> () > 0;
-    common.need_xyzrgba_ = num_slots<sig_cb_real_sense_point_cloud_rgba> () > 0;
-    if (common.need_xyz_ || common.need_xyzrgba_)
-    {
-      //select mode
-
-      //initial depth parameters
-    }
-    if (common.need_xyzrgba_)
-    {
-      //initial color parameters
-    }
-    //initial the device
-    common.frequency_.reset ();
-    common.is_running_ = true;
-    common.thread_ = boost::thread (&RealSenseGrabber::run, this);
+    need_xyz_ = num_slots<sig_cb_real_sense_point_cloud> () > 0;
+    need_xyzrgba_ = num_slots<sig_cb_real_sense_point_cloud_rgba> () > 0;
+    selectMode ();
+    p_->start ();
   }
 }
 
 void
 pcl::RealSenseGrabber::stop ()
 {
-  common.stop ();
+  if (is_running_)
+  {
+    is_running_ = false;
+    thread_.join ();
+  }
 }
 
 bool
 pcl::RealSenseGrabber::isRunning () const
 {
-  return common.isRunning ();
-}
-
-std::string
-pcl::RealSenseGrabber::getName () const
-{
-  return common.getName ();
+  return (is_running_);
 }
 
 float
 pcl::RealSenseGrabber::getFramesPerSecond () const
 {
-  return common.getFramesPerSecond ();
+  boost::mutex::scoped_lock lock (fps_mutex_);
+  return (frequency_.getFrequency ());
 }
 
 void
@@ -128,219 +170,123 @@ pcl::RealSenseGrabber::setConfidenceThreshold (unsigned int threshold)
   }
   else
   {
-    common.confidence_threshold_ = threshold;
-    //common. device_->getPXCDevice ().SetDepthConfidenceThreshold (confidence_threshold_);
+    p_->setConfidenceThreshold (threshold);
   }
 }
 
 void
-pcl::RealSenseGrabber::enableTemporalFiltering (Common::TemporalFilteringType type, size_t window_size)
+pcl::RealSenseGrabber::enableTemporalFiltering (TemporalFilteringType type, size_t window_size)
 {
-  common.enableTemporalFiltering (type, window_size);
-  if (!common.is_running_)
+  if (temporal_filtering_type_ != type ||
+     (type != RealSense_None && temporal_filtering_window_size_ != window_size))
   {
-  	start ();
+    temporal_filtering_type_ = type;
+    temporal_filtering_window_size_ = window_size;
+    if (is_running_)
+    {
+      stop ();
+      start ();
+    }
   }
 }
 
 void
 pcl::RealSenseGrabber::disableTemporalFiltering ()
 {
-  enableTemporalFiltering (Common::TemporalFilteringType::RealSense_None, 1);
+  enableTemporalFiltering (RealSense_None, 1);
 }
 
 const std::string&
 pcl::RealSenseGrabber::getDeviceSerialNumber () const
 {
-  return (common.getDeviceSerialNumber ());
+  return (device_->getSerialNumber ());
 }
 
-std::vector<Common::Mode>
+std::vector<pcl::RealSenseGrabber::Mode>
 pcl::RealSenseGrabber::getAvailableModes (bool only_depth) const
 {
-  std::vector<Common::Mode> modes;
-
-  return modes;
+  return (p_->getAvailableModes (only_depth));
 }
 
 void
-pcl::RealSenseGrabber::setMode (const Common::Mode& mode, bool strict)
+pcl::RealSenseGrabber::setMode (const Mode& mode, bool strict)
 {
-  common.setMode (mode, strict);
-  if(!common.is_running_)
+  if (mode == mode_requested_ && strict == strict_)
+    return;
+  mode_requested_ = mode;
+  strict_ = strict;
+  if (is_running_)
   {
-  	start ();
+    stop ();
+    start ();
   }
 }
 
-void
-pcl::RealSenseGrabber::run ()
+float
+pcl::RealSenseGrabber::computeModeScore (const Mode& mode)
 {
-  /*const int WIDTH = mode_selected_.depth_width;
-  const int HEIGHT = mode_selected_.depth_height;
-  const int SIZE = WIDTH * HEIGHT;*/
-  rs::device* device = common.device_->getDevice ();
-  device->enable_stream (rs::stream::depth, rs::preset::best_quality);
-  device->enable_stream (rs::stream::color, rs::preset::best_quality);
-  device->start ();
-  int count = 0;
-  int depth_width_;
-  int depth_height_;
-  int depth_size_;
-  int color_width_;
-  int color_height_;
-  int color_size_;
-  ///Buffer to store depth data
-  std::vector<uint16_t> depth_data_;
-  ///Buffer to store color data
-  std::vector<uint8_t> color_data_;
-  while (common.is_running_)
-  {
-    if (device->is_streaming ()) device->wait_for_frames ();
-    common.fps_mutex_.lock ();
-    common.frequency_.event ();
-    common.fps_mutex_.unlock ();
-    // Retrieve our images
-    const uint16_t * depth_image = (const uint16_t *)device->get_frame_data (rs::stream::depth);
-    const uint8_t * color_image = (const uint8_t *)device->get_frame_data (rs::stream::color);
-    // Retrieve camera parameters for mapping between depth and color
-    rs::intrinsics depth_intrin = device->get_stream_intrinsics (rs::stream::depth);
-    rs::intrinsics color_intrin = device->get_stream_intrinsics (rs::stream::color);
-    rs::extrinsics depth_to_color = device->get_extrinsics (rs::stream::depth, rs::stream::color);
-    float scale = device->get_depth_scale ();
-    
-    if (count == 0)
-    {
-      depth_width_ = depth_intrin.width;
-      depth_height_ = depth_intrin.height;
-      depth_size_ = depth_width_ * depth_height_;
-      color_width_ = color_intrin.width;
-      color_height_ = color_intrin.height;
-      color_size_ = color_width_ * color_height_ * 3;
-      depth_data_.resize (depth_size_);
-      color_data_.resize (color_size_);
-    }
-    
-    depth_data_.clear ();
-    pcl::PointCloud<pcl::PointXYZ>::Ptr xyz_cloud;
-    pcl::PointCloud<pcl::PointXYZRGBA>::Ptr xyzrgba_cloud;
-    float max_distance = 6; // get rid of noisy data that is past 6 meters
-    static const float nan = std::numeric_limits<float>::quiet_NaN ();
-
-    memcpy (depth_data_.data (), &depth_image[0], depth_size_ * sizeof (uint16_t));
-
-    if (common.need_xyzrgba_)
-    {
-      color_data_.clear ();
-      memcpy (color_data_.data (), &color_image[0], color_size_ * sizeof (uint8_t));
-      xyzrgba_cloud.reset (new pcl::PointCloud<pcl::PointXYZRGBA> (depth_width_, depth_height_));
-      xyzrgba_cloud->is_dense = false;
-      if (common.need_xyz_)
-      {
-        xyz_cloud.reset (new pcl::PointCloud<pcl::PointXYZ> (depth_width_, depth_height_));
-        xyz_cloud->is_dense = false;
-      }
-      for (int dy = 0; dy < depth_height_; ++dy)
-      {
-        uint i = dy * depth_width_ - 1;
-        for (int dx = 0; dx < depth_width_; ++dx)
-        {
-          i++;
-          // Retrieve the 16-bit depth value and map it into a depth in meters
-          uint16_t depth_value = depth_data_[i];
-          float depth_in_meters = depth_value * scale;
-
-          // Map from pixel coordinates in the depth image to real world co-ordinates
-          rs::float2 depth_pixel = {(float)dx, (float)dy};
-          rs::float3 depth_point = depth_intrin.deproject (depth_pixel, depth_in_meters);
-          rs::float3 color_point = depth_to_color.transform (depth_point);
-          rs::float2 color_pixel = color_intrin.project (color_point);
-
-          const int cx = (int)std::round (color_pixel.x), cy = (int)std::round (color_pixel.y);
-          int red = 0, green = 0, blue = 0;
-          if (cx < 0 || cy < 0 || cx >= color_width_ || cy >= color_height_)
-          {
-            red = 255; green = 255; blue = 255;
-          }
-          else
-          {
-            int pos = (cy * color_width_ + cx) * 3;
-            red =  color_data_[pos];
-            green = color_data_[pos + 1];
-            blue = color_data_[pos + 2];
-          }
-          if (depth_value == 0 || depth_point.z > max_distance)
-          {
-            xyzrgba_cloud->points[i].x = xyzrgba_cloud->points[i].y = xyzrgba_cloud->points[i].z = (float) nan;
-            if (common.need_xyz_)
-            {
-              xyz_cloud->points[i].x = xyz_cloud->points[i].y = xyz_cloud->points[i].z = (float) nan;
-            }
-            continue;
-          }
-          else
-          {
-            xyzrgba_cloud->points[i].x = depth_point.x;
-            xyzrgba_cloud->points[i].y = -depth_point.y;
-            xyzrgba_cloud->points[i].z = -depth_point.z;
-            xyzrgba_cloud->points[i].r = red;
-            xyzrgba_cloud->points[i].g = green;
-            xyzrgba_cloud->points[i].b = blue;
-            if (common.need_xyz_)
-            {
-              xyz_cloud->points[i].x = depth_point.x;
-              xyz_cloud->points[i].y = -depth_point.y;
-              xyz_cloud->points[i].z = -depth_point.z;
-            }
-          }
-        }
-      }
-      point_cloud_rgba_signal_->operator () (xyzrgba_cloud);
-      if (common.need_xyz_)
-      {
-        point_cloud_signal_->operator () (xyz_cloud);
-      }
-    }
-    else if (common.need_xyz_)
-    {
-      xyz_cloud.reset (new pcl::PointCloud<pcl::PointXYZ> (depth_width_, depth_height_));
-      xyz_cloud->is_dense = false;
-      for (int dy = 0; dy < depth_height_; ++dy)
-      {
-        uint i = dy * depth_width_ - 1;
-        for (int dx = 0; dx < depth_width_; ++dx)
-        {
-          i++;
-          // Retrieve the 16-bit depth value and map it into a depth in meters
-          uint16_t depth_value = depth_data_[i];
-          float depth_in_meters = depth_value * scale;
-          rs::float2 depth_pixel = {(float)dx, (float)dy};
-          rs::float3 depth_point = depth_intrin.deproject (depth_pixel, depth_in_meters);
-          if (depth_value == 0 || depth_point.z > max_distance)
-          {
-            xyz_cloud->points[i].x = xyz_cloud->points[i].y = xyz_cloud->points[i].z = (float) nan;
-            continue;
-          }
-          else
-          {
-            xyz_cloud->points[i].x = depth_point.x;
-            xyz_cloud->points[i].y = -depth_point.y;
-            xyz_cloud->points[i].z = -depth_point.z;
-          }
-        }
-      }
-      point_cloud_signal_->operator () (xyz_cloud);
-    }
-    else
-    {
-      //do nothing
-    }
-    count++;
-    if (count == 100000) count = 1;
-  }
+  const float FPS_WEIGHT = 100000;
+  const float DEPTH_WEIGHT = 1000;
+  const float COLOR_WEIGHT = 1;
+  int f = mode.fps - mode_requested_.fps;
+  int dw = mode.depth_width - mode_requested_.depth_width;
+  int dh = mode.depth_height - mode_requested_.depth_height;
+  int cw = mode.color_width - mode_requested_.color_width;
+  int ch = mode.color_height - mode_requested_.color_height;
+  float penalty;
+  penalty  = std::abs (FPS_WEIGHT * f * (mode_requested_.fps != 0));
+  penalty += std::abs (DEPTH_WEIGHT * dw * (mode_requested_.depth_width != 0));
+  penalty += std::abs (DEPTH_WEIGHT * dh * (mode_requested_.depth_height != 0));
+  penalty += std::abs (COLOR_WEIGHT * cw * (mode_requested_.color_width != 0 && need_xyzrgba_));
+  penalty += std::abs (COLOR_WEIGHT * ch * (mode_requested_.color_height != 0 && need_xyzrgba_));
+  return penalty;
 }
 
 void
 pcl::RealSenseGrabber::selectMode ()
 {
+  
+  if (mode_requested_ == Mode ()) printf("mode_requested_ == Mode\n");
+  else printf("mode_requested_ != Mode\n");
+  if (mode_requested_ == Mode ())
+    mode_requested_ = Mode (30, 640, 480, 640, 480);
+  printf("mode_requested_ fps: %i\n",mode_requested_.fps);
+  /*float best_score = std::numeric_limits<float>::max ();
+  std::vector<Mode> modes = getAvailableModes (!need_xyzrgba_);
+  for (size_t i = 0; i < modes.size (); ++i)
+  {
+    Mode mode = modes[i];
+    float score = computeModeScore (mode);
+    if (score < best_score)
+    {
+      best_score = score;
+      mode_selected_ = mode;
+    }
+  }
+  if (strict_ && best_score > 0)
+    THROW_IO_EXCEPTION ("RealSense device does not support requested mode");*/
+}
+
+void
+pcl::RealSenseGrabber::createDepthBuffer ()
+{
+  size_t size = mode_selected_.depth_width * mode_selected_.depth_height;
+  switch (temporal_filtering_type_)
+  {
+  case RealSense_None:
+  {
+    depth_buffer_.reset (new pcl::io::SingleBuffer<unsigned short> (size));
+    break;
+  }
+  case RealSense_Median:
+  {
+    depth_buffer_.reset (new pcl::io::MedianBuffer<unsigned short> (size, temporal_filtering_window_size_));
+    break;
+  }
+  case RealSense_Average:
+  {
+    depth_buffer_.reset (new pcl::io::AverageBuffer<unsigned short> (size, temporal_filtering_window_size_));
+    break;
+  }
+  }
 }
